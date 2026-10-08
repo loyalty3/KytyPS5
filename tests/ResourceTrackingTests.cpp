@@ -384,6 +384,49 @@ void TestInvariantIndirectImageMaterialization() {
         "malformed image table tracking was not transactional");
 }
 
+void TestBoundedImageTableNullsIncompatibleViews() {
+  using Type = Libs::Graphics::Prospero::ImageType;
+  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
+  fixture->PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture->program);
+  std::array<uint32_t, 8> data{0x3000u, 16u << 16u, 1u, 0u,
+                              0x2000u, 48u << 16u, 5u, 0u};
+  LinearTestMemory memory;
+  memory.fail_address = 0x3000u;
+  const auto descriptor = [](uint32_t identity, uint32_t format) {
+    return std::array<uint32_t, 8>{identity, format << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Type::kColor2D) << 28u),
+        0u, 0u, 0u, 0u};
+  };
+  // A broad heap: four views share one typed class, one uses a different numeric class.
+  const std::array formats{75u, 75u, 56u, 75u, 75u};
+  for (uint32_t row = 0; row < formats.size(); ++row) {
+    const auto value = descriptor(0x20u + row, formats[row]);
+    std::copy(value.begin(), value.end(), memory.words.begin() + (0x1010u + row * 48u) / 4u);
+  }
+  SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "an incompatible view in a broad heap table aborted specialization");
+  uint32_t nulled = 0, kept = 0;
+  for (uint32_t i = 0; i < snapshot.images.size(); ++i) {
+    const auto &words = snapshot.images[i].dwords;
+    if (words[0] == 0u && (words[1] & 0xffu) == 0u) {
+      ++nulled;
+    } else {
+      ++kept;
+      Check(((words[1] >> 20u) & 0x1ffu) == 75u,
+            "the minority view class survived in a broad heap table");
+    }
+    Check(specialization.images[i].numeric_class == specialization.images[0].numeric_class,
+          "table candidates kept mixed numeric classes");
+  }
+  Check(nulled >= 1u && kept >= 2u,
+        "broad heap table did not null exactly the incompatible view");
+}
+
 void TestBoundedImageViewEligibility() {
   using Type = Libs::Graphics::Prospero::ImageType;
   auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
@@ -3573,6 +3616,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
+    Run("bounded image table nulls incompatible views", TestBoundedImageTableNullsIncompatibleViews);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

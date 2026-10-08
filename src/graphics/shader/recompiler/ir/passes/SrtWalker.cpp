@@ -21,6 +21,9 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+// Guest pointers below this are never mapped. The host evaluates scalar loads speculatively, so a
+// null pointer the shader would branch around reads as zero instead of faulting the emulator.
+constexpr uint64_t GuestNullPageEnd = 0x10000ull;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
@@ -526,6 +529,10 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
+		if (address < GuestNullPageEnd) {
+			result = 0u;
+			return true;
+		}
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;

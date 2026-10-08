@@ -160,6 +160,10 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 	auto& capture = *static_cast<ReadCapture*>(userdata);
 	if (capture.source.read_memory != nullptr) {
 		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
+	} else if (address < 0x10000u) {
+		// Never-mapped guest null page: see GuestNullPageEnd in SrtWalker.cpp.
+		std::fill(values.begin(), values.end(), 0u);
+		return true;
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}

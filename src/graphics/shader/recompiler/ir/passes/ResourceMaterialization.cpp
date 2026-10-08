@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -602,30 +603,70 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		        snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
+		const auto is_2d = [](Decoder::ImageDimension dimension) {
+			return dimension == Decoder::ImageDimension::Dim2D ||
+			       dimension == Decoder::ImageDimension::Dim2DArray;
+		};
+		const auto compatible = [&](const ResourceSpecialization::Image& a,
+		                            const ResourceSpecialization::Image& b) {
+			const bool same_coordinates = a.dimension == b.dimension && a.cube == b.cube;
+			return a.numeric_class == b.numeric_class &&
+			       (same_coordinates || (is_2d(a.dimension) && is_2d(b.dimension))) &&
+			       a.mip_count == b.mip_count && a.conversion_format == b.conversion_format &&
+			       a.shader_swizzle == b.shader_swizzle;
+		};
+		// A bounded table indexes a broad descriptor heap, which also holds views meant for other
+		// typed image operations (see the dimension filter in MaterializeResources). Such tables
+		// take the most common compatible view class and null the rest instead of failing.
+		const auto* root_source = Source(program, program.info.images[root_index].source);
+		const bool  bounded_table =
+		    root_source != nullptr && root_source->indirect_descriptor.has_value() &&
+		    IsBoundedDescriptorTable(program, *root_source->indirect_descriptor);
 		uint32_t exemplar       = ImageResource::NoIndirectImage;
+		uint32_t exemplar_votes = 0;
 		uint32_t resource_count = 0;
 		for (uint32_t resource = 0; resource < specialization.images.size(); resource++) {
 			if (specialization.images[resource].indirect_root != root_index) {
 				continue;
 			}
 			resource_count++;
-			if (exemplar == ImageResource::NoIndirectImage &&
-			    !NullImageDescriptor(snapshot.images[resource])) {
-				exemplar = resource;
+			if (NullImageDescriptor(snapshot.images[resource])) {
+				continue;
+			}
+			if (!bounded_table) {
+				if (exemplar == ImageResource::NoIndirectImage) {
+					exemplar = resource;
+				}
+				continue;
+			}
+			uint32_t votes = 0;
+			for (uint32_t other = 0; other < specialization.images.size(); other++) {
+				if (specialization.images[other].indirect_root == root_index &&
+				    !NullImageDescriptor(snapshot.images[other]) &&
+				    compatible(specialization.images[resource], specialization.images[other])) {
+					votes++;
+				}
+			}
+			if (votes > exemplar_votes) {
+				exemplar       = resource;
+				exemplar_votes = votes;
 			}
 		}
 		if (resource_count < 2u || exemplar == ImageResource::NoIndirectImage) {
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
-		const auto& image_class = specialization.images[exemplar];
-		const auto is_2d = [](Decoder::ImageDimension dimension) {
-			return dimension == Decoder::ImageDimension::Dim2D ||
-			       dimension == Decoder::ImageDimension::Dim2DArray;
-		};
+		const auto image_class = specialization.images[exemplar];
+		uint32_t   dropped     = 0;
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
 				continue;
+			}
+			if (bounded_table && !NullImageDescriptor(snapshot.images[candidate]) &&
+			    !compatible(image, image_class)) {
+				snapshot.images[candidate].dwords.fill(0u);
+				image.fmask = false;
+				dropped++;
 			}
 			if (NullImageDescriptor(snapshot.images[candidate])) {
 				image.numeric_class     = image_class.numeric_class;
@@ -635,17 +676,18 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
-			const bool same_coordinates = image.dimension == image_class.dimension &&
-			                              image.cube == image_class.cube;
-			if (image.numeric_class != image_class.numeric_class ||
-			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
-			    image.mip_count != image_class.mip_count ||
-			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle) {
+			if (!compatible(image, image_class)) {
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
 				                program.info.images[root_index].first_use_pc));
 			}
+		}
+		static std::atomic<uint32_t> dropped_reports {0};
+		if (dropped != 0u && dropped_reports.fetch_add(1u, std::memory_order_relaxed) < 32u) {
+			std::fprintf(stderr,
+			             "shader resource specialization: indirect image table at pc 0x%08x "
+			             "nulled %u of %u incompatible heap views\n",
+			             program.info.images[root_index].first_use_pc, dropped, resource_count);
 		}
 	}
 	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });

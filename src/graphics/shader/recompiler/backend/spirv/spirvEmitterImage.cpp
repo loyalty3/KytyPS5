@@ -3,7 +3,12 @@
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
+#include <iterator>
+#include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -886,6 +891,91 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			}
 			runs.push_back({ordinal, 1u, resource,
 			                ResourceForDescriptor(state, kind, resource) - ordinal});
+		}
+		// Interleaved view classes split the table into many contiguous runs, and emitting one
+		// sample per run made material shaders with large heaps hundreds of thousands of words
+		// long. Past a few runs, select the descriptor slot through a constant per-ordinal table
+		// and emit one sample per distinct view class instead.
+		constexpr size_t MaxContiguousRuns = 4u;
+		if (runs.size() > MaxContiguousRuns) {
+			struct ViewGroup {
+				IR::DescriptorBindingKind kind;
+				ImageDimension            dimension;
+				bool                      cube;
+				uint32_t                  resource;
+			};
+			const auto count = static_cast<uint32_t>(image.indirect_resources.size());
+			std::vector<ViewGroup> groups;
+			std::vector<uint32_t>  group_of(count);
+			std::vector<uint32_t>  slot_of(count);
+			for (uint32_t ordinal = 0; ordinal < count; ++ordinal) {
+				const auto resource   = image.indirect_resources[ordinal];
+				const auto& candidate = state.program.info.images[resource];
+				const auto kind       = *IR::DescriptorBindingForImage(candidate);
+				auto group = std::find_if(groups.begin(), groups.end(), [&](const ViewGroup& g) {
+					return g.kind == kind && g.dimension == candidate.dimension &&
+					       g.cube == candidate.cube;
+				});
+				if (group == groups.end()) {
+					groups.push_back({kind, candidate.dimension, candidate.cube, resource});
+					group = std::prev(groups.end());
+				}
+				group_of[ordinal] = static_cast<uint32_t>(group - groups.begin());
+				slot_of[ordinal]  = ResourceForDescriptor(state, kind, resource);
+			}
+			auto& tables = state.indirect_image_tables[mem.resource];
+			const auto DefineTable = [&](const std::vector<uint32_t>& values) {
+				std::vector<uint32_t> constants;
+				constants.reserve(values.size());
+				for (const auto value: values) {
+					constants.push_back(ConstantU32(state, value));
+				}
+				const auto array_type =
+				    state.builder.Type(spv::OpTypeArray, TypeU32(state), ConstantU32(state, count));
+				const auto initializer = state.builder.Constant(
+				    spv::OpConstantComposite, array_type, std::span<const uint32_t>(constants));
+				return state.builder.DefineInitializedGlobalVariable(
+				    TypePointer(state, spv::StorageClassPrivate, array_type),
+				    spv::StorageClassPrivate, initializer);
+			};
+			if (tables[0] == 0u) {
+				tables[0] = DefineTable(slot_of);
+				tables[1] = groups.size() > 1u ? DefineTable(group_of) : 0u;
+			}
+			const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), selected,
+			                             ConstantU32(state, count));
+			const auto ordinal = Select(state, TypeU32(state), in_range, selected,
+			                            ConstantU32(state, 0u));
+			const auto LoadTable = [&](uint32_t table) {
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain,
+				                          TypePointer(state, spv::StorageClassPrivate, TypeU32(state)),
+				                          pointer, table, ordinal);
+				const auto value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+				return value;
+			};
+			const auto slot = LoadTable(tables[0]);
+			auto result = groups.size() == 1u
+			                  ? EmitSample(groups.front().resource, slot)
+			                  : EmitIndexSwitch(state, LoadTable(tables[1]),
+			                                    static_cast<uint32_t>(groups.size()), result_type,
+			                                    [&](uint32_t group) {
+				                                    return EmitSample(groups[group].resource, slot);
+			                                    });
+			static std::atomic<uint32_t> table_reports {0};
+			if (table_reports.fetch_add(1u, std::memory_order_relaxed) < 32u) {
+				std::fprintf(stderr,
+				             "shader image table: hash=0x%016" PRIx64 " pc=0x%08x %u views in %zu runs "
+				             "-> %zu view classes\n",
+				             state.program.shader_hash, image.first_use_pc, count, runs.size(),
+				             groups.size());
+			}
+			if (!dref) {
+				result = UnpackImageTexel(ctx, mem, result);
+			}
+			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
+			return;
 		}
 		const auto EmitRun = [&](uint32_t index) {
 			const auto& run = runs[index];

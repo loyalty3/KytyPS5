@@ -130,6 +130,8 @@ struct EmitterState {
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
+	// Per indirect image root: Private u32 tables of {descriptor slot, view group} by ordinal.
+	std::unordered_map<uint32_t, std::array<uint32_t, 2>> indirect_image_tables;
 	spv::StorageClass                                lds_storage_class = spv::StorageClassFunction;
 	uint32_t                                         lds_base_dwords         = 0;
 	uint32_t                                         lds_variable            = 0;

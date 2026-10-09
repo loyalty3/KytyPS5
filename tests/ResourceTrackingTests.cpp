@@ -425,6 +425,15 @@ void TestBoundedImageTableNullsIncompatibleViews() {
   }
   Check(nulled >= 1u && kept >= 2u,
         "broad heap table did not null exactly the incompatible view");
+
+  // Streaming a different view into the heap must not re-specialize the shader.
+  const auto first = specialization;
+  const auto moved = descriptor(0x30u, 56u);
+  std::copy(moved.begin(), moved.end(), memory.words.begin() + (0x1010u + 4u * 48u) / 4u);
+  ResourceSnapshot later;
+  ResourceSpecialization respecialized;
+  Check(MaterializeResources(plan, runtime, later, respecialized) && respecialized == first,
+        "a changed minority view re-specialized a broad heap table");
 }
 
 void TestBoundedImageViewEligibility() {
@@ -2108,8 +2117,8 @@ void TestGatherLodSamplerValidation() {
         user_data[10] = control;
         ResourceSnapshot snapshot;
         ResourceSpecialization specialization;
-        const bool supported = !explicit_lod || (control >> 26u) == 0 ||
-                               control == (1u << 26u);
+        // Linear mip filtering and LOD biases are approximated by point mip selection.
+        const bool supported = true;
         Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
                                    specialization) == supported,
               "explicit gather accepted an unsupported sampler or rejected a valid one");

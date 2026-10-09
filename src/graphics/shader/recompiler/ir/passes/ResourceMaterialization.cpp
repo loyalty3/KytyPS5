@@ -611,14 +611,6 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim2D ||
 			       dimension == Decoder::ImageDimension::Dim2DArray;
 		};
-		const auto compatible = [&](const ResourceSpecialization::Image& a,
-		                            const ResourceSpecialization::Image& b) {
-			const bool same_coordinates = a.dimension == b.dimension && a.cube == b.cube;
-			return a.numeric_class == b.numeric_class &&
-			       (same_coordinates || (is_2d(a.dimension) && is_2d(b.dimension))) &&
-			       a.mip_count == b.mip_count && a.conversion_format == b.conversion_format &&
-			       a.shader_swizzle == b.shader_swizzle;
-		};
 		// A bounded table indexes a broad descriptor heap, which also holds views meant for other
 		// typed image operations (see the dimension filter in MaterializeResources). Such tables
 		// take the most common compatible view class and null the rest instead of failing.
@@ -626,6 +618,18 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const bool  bounded_table =
 		    root_source != nullptr && root_source->indirect_descriptor.has_value() &&
 		    IsBoundedDescriptorTable(program, *root_source->indirect_descriptor);
+		// Bounded tables keep one exact view class (including cube-ness). Mixed classes cost a
+		// sample per class at every site, and which heap views are populated changes as the
+		// title streams, so a mixed class set re-specialized and recompiled the shader each time.
+		const auto compatible = [&](const ResourceSpecialization::Image& a,
+		                            const ResourceSpecialization::Image& b) {
+			const bool same_coordinates = a.dimension == b.dimension && a.cube == b.cube;
+			return a.numeric_class == b.numeric_class &&
+			       (same_coordinates ||
+			        (!bounded_table && is_2d(a.dimension) && is_2d(b.dimension))) &&
+			       a.mip_count == b.mip_count && a.conversion_format == b.conversion_format &&
+			       a.shader_swizzle == b.shader_swizzle;
+		};
 		uint32_t exemplar       = ImageResource::NoIndirectImage;
 		uint32_t exemplar_votes = 0;
 		uint32_t resource_count = 0;
@@ -1262,11 +1266,17 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		if (program.info.samplers[i].gather_lod) {
 			const auto control = snapshot.samplers[i].dwords[2];
 			const auto filter = (control >> 26u) & 3u;
-			// MipNone always selects the base level. Explicit point gathers currently require
-			// encoded-zero primary and secondary bias; linear primary-mip selection is unsupported.
+			// MipNone always selects the base level. A gather returns texels of one level, and the
+			// emitter rounds the explicit LOD to the nearest level; linear mip filtering and LOD
+			// biases are approximated by that point selection rather than aborting the emulator.
 			if (filter > 1u || (filter == 1u && (control & 0xfffffu) != 0u)) {
-				return SpecializationFail(
-				    "explicit-LOD gather requires mip filtering None or Point with zero LOD biases");
+				static std::atomic<uint32_t> gather_reports {0};
+				if (gather_reports.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+					std::fprintf(stderr,
+					             "Warning: explicit-LOD gather with sampler control 0x%08x uses "
+					             "point mip selection without LOD bias\n",
+					             control);
+				}
 			}
 		}
 	}
